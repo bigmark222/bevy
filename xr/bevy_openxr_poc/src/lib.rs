@@ -53,7 +53,12 @@ use ash::vk::Handle as _;
 use bevy::{
     prelude::*,
     render::{
+        render_resource::{
+            Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+            TextureViewDescriptor, TextureViewDimension,
+        },
         renderer::{raw_vulkan_init::RawVulkanInitSettings, RenderDevice},
+        texture::ManualTextureView,
         RenderApp,
     },
 };
@@ -184,14 +189,57 @@ impl Plugin for OpenXrPlugin {
             return;
         }
 
-        match create_session(app) {
+        let session = match create_session(app) {
             Ok(session) => {
                 info!("OpenXR session created against Bevy's Vulkan device");
-                app.insert_resource(session);
+                session
             }
-            Err(err) => error!("failed to create OpenXR session: {err}"),
+            Err(err) => {
+                error!("failed to create OpenXR session: {err}");
+                return;
+            }
+        };
+
+        match create_swapchain(app, &session.session) {
+            Ok(swapchain) => {
+                info!(
+                    "OpenXR stereo swapchain wrapped: {} runtime-owned image(s), \
+                     {}x{} x {} layer(s), {:?}",
+                    swapchain.views.len(),
+                    swapchain.resolution.x,
+                    swapchain.resolution.y,
+                    swapchain.view_count,
+                    swapchain.format,
+                );
+                app.insert_resource(swapchain);
+            }
+            Err(err) => error!("failed to wrap the OpenXR swapchain: {err}"),
         }
+
+        app.insert_resource(session);
     }
+}
+
+/// The runtime's stereo swapchain, with each runtime-owned image wrapped as a
+/// Bevy [`ManualTextureView`].
+///
+/// The images belong to the OpenXR runtime, not to us: they are created by
+/// `xrCreateSwapchain` and handed out one at a time by
+/// `xrAcquireSwapchainImage`. They are wrapped here with
+/// `TextureMemory::External` and no drop guard, so wgpu will never try to free
+/// memory it doesn't own.
+///
+/// Every image is a `D2Array` view with one layer per eye — exactly the shape
+/// `Multiview` renders into.
+#[derive(Resource)]
+pub struct OpenXrSwapchain {
+    pub swapchain: openxr::Swapchain<openxr::Vulkan>,
+    /// One per runtime-owned image, in the index order
+    /// `xrAcquireSwapchainImage` reports.
+    pub views: Vec<ManualTextureView>,
+    pub resolution: UVec2,
+    pub view_count: u32,
+    pub format: TextureFormat,
 }
 
 /// What [`init_openxr`] produces: the OpenXR handles, plus the Vulkan
@@ -327,6 +375,167 @@ fn load_openxr_entry() -> Result<openxr::Entry, Box<dyn Error>> {
         failures.join("; ")
     )
     .into())
+}
+
+/// Vulkan formats we know how to hand to wgpu, best first.
+///
+/// The runtime returns its supported formats in preference order, but we can
+/// only use ones wgpu has a matching [`TextureFormat`] for, so the intersection
+/// is taken rather than blindly accepting the runtime's first choice. sRGB
+/// variants come first: the runtime composites in sRGB, and picking a UNORM
+/// format here would double-apply the transfer function.
+const SWAPCHAIN_FORMATS: &[(u32, TextureFormat)] = &[
+    // VK_FORMAT_R8G8B8A8_SRGB
+    (43, TextureFormat::Rgba8UnormSrgb),
+    // VK_FORMAT_B8G8R8A8_SRGB
+    (50, TextureFormat::Bgra8UnormSrgb),
+    // VK_FORMAT_R8G8B8A8_UNORM
+    (37, TextureFormat::Rgba8Unorm),
+    // VK_FORMAT_B8G8R8A8_UNORM
+    (44, TextureFormat::Bgra8Unorm),
+];
+
+/// Creates the stereo swapchain and wraps each runtime-owned image as a
+/// [`ManualTextureView`].
+///
+/// This is where the XR side and the multiview side meet: `array_size` is the
+/// view count from the runtime's stereo view configuration, which produces
+/// exactly the two-layer array texture `examples/3d/multiview.rs` builds by
+/// hand.
+fn create_swapchain(
+    app: &App,
+    session: &openxr::Session<openxr::Vulkan>,
+) -> Result<OpenXrSwapchain, Box<dyn Error>> {
+    let context = app.world().resource::<OpenXrContext>();
+
+    let views = context.instance.enumerate_view_configuration_views(
+        context.system,
+        openxr::ViewConfigurationType::PRIMARY_STEREO,
+    )?;
+    let first = views.first().ok_or("runtime reported no stereo views")?;
+    let resolution = UVec2::new(
+        first.recommended_image_rect_width,
+        first.recommended_image_rect_height,
+    );
+    let view_count = views.len() as u32;
+
+    let runtime_formats = session.enumerate_swapchain_formats()?;
+    let (vk_format, format) = SWAPCHAIN_FORMATS
+        .iter()
+        .find(|(vk, _)| runtime_formats.contains(vk))
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "no usable swapchain format; runtime offers {runtime_formats:?}, \
+                 none of which map to a wgpu format we handle"
+            )
+        })?;
+
+    let swapchain = session.create_swapchain(&openxr::SwapchainCreateInfo {
+        create_flags: openxr::SwapchainCreateFlags::EMPTY,
+        // COLOR_ATTACHMENT so Bevy can render into it; SAMPLED because the
+        // compositor reads it back.
+        usage_flags: openxr::SwapchainUsageFlags::COLOR_ATTACHMENT
+            | openxr::SwapchainUsageFlags::SAMPLED,
+        format: vk_format,
+        // Single-sampled. Multiview and MSAA don't combine (WGSL has no
+        // `texture_depth_multisampled_2d_array`), and the runtime recommends 1
+        // anyway, so the engine constraint and the runtime's preference agree.
+        sample_count: 1,
+        width: resolution.x,
+        height: resolution.y,
+        face_count: 1,
+        // One array layer per eye. This is the whole point.
+        array_size: view_count,
+        mip_count: 1,
+    })?;
+
+    let render_device = app
+        .sub_app(RenderApp)
+        .world()
+        .resource::<RenderDevice>()
+        .wgpu_device()
+        .clone();
+
+    let size = Extent3d {
+        width: resolution.x,
+        height: resolution.y,
+        depth_or_array_layers: view_count,
+    };
+
+    let wrapped = swapchain
+        .enumerate_images()?
+        .into_iter()
+        .map(|image| {
+            // SAFETY: `image` is a live `VkImage` owned by the OpenXR runtime,
+            // created with the dimensions, format and layer count described
+            // here. `TextureMemory::External` and the absent drop callback are
+            // what keep wgpu from freeing memory it does not own — the runtime
+            // destroys these with the swapchain.
+            let hal_texture = unsafe {
+                let hal_device = render_device
+                    .as_hal::<Vulkan>()
+                    .ok_or("not running on the Vulkan backend")?;
+
+                hal_device.texture_from_raw(
+                    ash::vk::Image::from_raw(image),
+                    &wgpu::hal::TextureDescriptor {
+                        label: Some("openxr_swapchain_image"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::RESOURCE,
+                        memory_flags: wgpu::hal::MemoryFlags::empty(),
+                        view_formats: vec![],
+                    },
+                    None,
+                    wgpu::hal::vulkan::TextureMemory::External,
+                )
+            };
+
+            // SAFETY: the descriptor matches the one above, and the image has
+            // no meaningful contents until we render into it.
+            let texture = unsafe {
+                render_device.create_texture_from_hal::<Vulkan>(
+                    hal_texture,
+                    &TextureDescriptor {
+                        label: Some("openxr_swapchain_image"),
+                        size,
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format,
+                        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::TextureUses::UNINITIALIZED,
+                )
+            };
+
+            // `D2Array` so a multiview pass can address every layer.
+            let texture_view = texture.create_view(&TextureViewDescriptor {
+                label: Some("openxr_swapchain_image_view"),
+                dimension: Some(TextureViewDimension::D2Array),
+                ..default()
+            });
+
+            Ok(ManualTextureView {
+                texture_view: texture_view.into(),
+                size: resolution,
+                view_format: format,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+    Ok(OpenXrSwapchain {
+        swapchain,
+        views: wrapped,
+        resolution,
+        view_count,
+        format,
+    })
 }
 
 /// Renders an extension list for logging.
