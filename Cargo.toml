@@ -30,6 +30,8 @@ members = [
   "examples/no_std/*",
   # Examples of compiling Bevy with automatic reflect type registration for platforms without `inventory` support.
   "examples/reflection/auto_register_static",
+  # OpenXR proof-of-concept driving the multiview path on real XR hardware.
+  "xr/bevy_openxr_poc",
   # Examples of large bevy scenes.
   "examples/large_scenes/bistro",
   "examples/large_scenes/caldera_hotel",

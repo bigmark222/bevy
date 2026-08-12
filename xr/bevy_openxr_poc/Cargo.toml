@@ -1,0 +1,36 @@
+[package]
+name = "bevy_openxr_poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Proof-of-concept OpenXR/Vulkan interop for Bevy's multiview rendering"
+
+[dependencies]
+# `raw_vulkan_init` exposes the create-instance / create-device callbacks that
+# let OpenXR dictate the Vulkan extensions Bevy must enable.
+bevy = { path = "../..", features = ["raw_vulkan_init"] }
+
+# `loaded` (the default) resolves the OpenXR loader with libloading at runtime,
+# so this crate builds on machines with no loader installed and fails at
+# `Entry::load()` instead of at link time. That is what lets it compile on the
+# macOS dev machine.
+openxr = "0.21"
+
+# Must match the versions Bevy resolves, so cargo unifies them to one crate and
+# the raw handles are the same types. See `Cargo.lock`.
+ash = "0.38"
+wgpu = { version = "30", default-features = false, features = ["vulkan"] }
+
+# wgpu's `vulkan` feature is a no-op on Apple platforms, so `wgpu::hal::vulkan`
+# — which `bevy_render`'s own `raw_vulkan_init` module refers to unconditionally
+# — is configured out and the build fails before reaching any of our code.
+# `vulkan-portability` routes Vulkan through MoltenVK and restores the module.
+#
+# This exists purely so the crate type-checks on the macOS development machine.
+# It is NOT a claim that any of this runs there: MoltenVK has no multiview and
+# there is no OpenXR runtime. Scoped to Apple targets so the Linux and Windows
+# builds are untouched.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { version = "30", default-features = false, features = [
+  "vulkan-portability",
+] }
