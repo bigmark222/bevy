@@ -245,6 +245,37 @@ fn init_openxr() -> Result<OpenXrInit, Box<dyn Error>> {
         requirements.min_api_version_supported, requirements.max_api_version_supported
     );
 
+    // The view configuration is what decides whether multiview is even the
+    // right rendering strategy: a stereo config reports one entry per eye, and
+    // its recommended dimensions are the size the swapchain array texture has
+    // to be in step 2. Reported here because it is the first thing step 2 needs
+    // and the cheapest place to catch a runtime that isn't actually stereo.
+    let views = instance.enumerate_view_configuration_views(
+        system,
+        openxr::ViewConfigurationType::PRIMARY_STEREO,
+    )?;
+    eprintln!(
+        "[openxr] primary stereo view configuration: {} view(s)",
+        views.len()
+    );
+    for (index, view) in views.iter().enumerate() {
+        eprintln!(
+            "[openxr]   view {index}: recommended {}x{} (max {}x{}), {} sample(s)",
+            view.recommended_image_rect_width,
+            view.recommended_image_rect_height,
+            view.max_image_rect_width,
+            view.max_image_rect_height,
+            view.recommended_swapchain_sample_count,
+        );
+    }
+    if views.len() != 2 {
+        eprintln!(
+            "[openxr] WARNING: expected 2 views for PRIMARY_STEREO, got {}. \
+             Multiview assumes one layer per eye.",
+            views.len()
+        );
+    }
+
     let instance_extensions =
         parse_extension_list(&instance.vulkan_legacy_instance_extensions(system)?);
     let device_extensions =
