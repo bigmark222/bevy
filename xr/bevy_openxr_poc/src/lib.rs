@@ -83,6 +83,11 @@ pub struct OpenXrSession {
     pub frame_stream: openxr::FrameStream<openxr::Vulkan>,
 }
 
+/// Why OpenXR initialization failed, carried forward so it can be reported
+/// through the log once logging actually exists.
+#[derive(Resource)]
+struct OpenXrInitError(String);
+
 /// Creates the OpenXR instance and teaches Bevy's Vulkan init which extensions
 /// the runtime requires.
 ///
@@ -93,6 +98,12 @@ pub struct OpenXrInitPlugin;
 
 impl Plugin for OpenXrInitPlugin {
     fn build(&self, app: &mut App) {
+        // NOTE: this plugin has to be added before `DefaultPlugins`, which is
+        // where `LogPlugin` installs the tracing subscriber -- so `info!` and
+        // friends are silently discarded in here. Diagnostics go to stderr
+        // directly, and the failure is also stashed in a resource so
+        // `OpenXrPlugin::finish` can report it through the log once there is
+        // one.
         let OpenXrInit {
             context,
             instance_extensions,
@@ -100,18 +111,23 @@ impl Plugin for OpenXrInitPlugin {
         } = match init_openxr() {
             Ok(parts) => parts,
             Err(err) => {
-                warn!(
-                    "OpenXR unavailable ({err}); continuing without XR. \
-                     The app will run as an ordinary Bevy app."
+                eprintln!(
+                    "[openxr] unavailable: {err}\n\
+                     [openxr] continuing without XR; the app will run as an ordinary Bevy app."
                 );
+                app.insert_resource(OpenXrInitError(err.to_string()));
                 return;
             }
         };
 
-        info!(
-            "OpenXR instance created; runtime requires {} instance and {} device extension(s)",
+        eprintln!(
+            "[openxr] instance created\n\
+             [openxr]   required instance extensions ({}): {}\n\
+             [openxr]   required device extensions ({}): {}",
             instance_extensions.len(),
-            device_extensions.len()
+            format_extensions(&instance_extensions),
+            device_extensions.len(),
+            format_extensions(&device_extensions),
         );
 
         {
@@ -158,7 +174,13 @@ impl Plugin for OpenXrPlugin {
     // `finish` runs after `RenderPlugin` has initialized the renderer, which is
     // the earliest point a `RenderDevice` — and therefore a `VkDevice` — exists.
     fn finish(&self, app: &mut App) {
+        // Re-report the init failure now that logging exists.
+        if let Some(err) = app.world().get_resource::<OpenXrInitError>() {
+            error!("OpenXR unavailable: {}", err.0);
+            return;
+        }
         if app.world().get_resource::<OpenXrContext>().is_none() {
+            error!("OpenXrInitPlugin was not added before DefaultPlugins; no XR instance exists");
             return;
         }
 
@@ -220,8 +242,9 @@ fn init_openxr() -> Result<OpenXrInit, Box<dyn Error>> {
     // The spec requires this be called before session creation, and it reports
     // the Vulkan version range the runtime supports.
     let requirements = instance.graphics_requirements::<openxr::Vulkan>(system)?;
-    info!(
-        "OpenXR runtime supports Vulkan {} to {}",
+    // stderr, not `info!` -- see the note in `OpenXrInitPlugin::build`.
+    eprintln!(
+        "[openxr] runtime supports Vulkan {} to {}",
         requirements.min_api_version_supported, requirements.max_api_version_supported
     );
 
@@ -239,6 +262,18 @@ fn init_openxr() -> Result<OpenXrInit, Box<dyn Error>> {
         instance_extensions,
         device_extensions,
     })
+}
+
+/// Renders an extension list for logging.
+fn format_extensions(extensions: &[&'static CStr]) -> String {
+    if extensions.is_empty() {
+        return "(none)".to_string();
+    }
+    extensions
+        .iter()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Splits OpenXR's space-separated extension string into `CStr`s.
