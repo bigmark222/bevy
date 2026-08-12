@@ -210,10 +210,7 @@ struct OpenXrInit {
 /// isn't possible, and doing the work up front means a runtime that refuses to
 /// answer fails before Bevy has built anything.
 fn init_openxr() -> Result<OpenXrInit, Box<dyn Error>> {
-    // SAFETY: `Entry::load` resolves the OpenXR loader from the platform's
-    // standard search path. It is unsafe because loading an arbitrary shared
-    // library runs its initializers.
-    let entry = unsafe { openxr::Entry::load()? };
+    let entry = load_openxr_entry()?;
 
     let available = entry.enumerate_extensions()?;
     if !available.khr_vulkan_enable {
@@ -262,6 +259,43 @@ fn init_openxr() -> Result<OpenXrInit, Box<dyn Error>> {
         instance_extensions,
         device_extensions,
     })
+}
+
+/// Loads the OpenXR loader shared library.
+///
+/// `Entry::load()` only tries the *unversioned* `libopenxr_loader.so`, which on
+/// most Linux distributions ships in the `-devel` package rather than the
+/// runtime one — Fedora's `openxr-libs` installs `libopenxr_loader.so.1` and
+/// nothing else, so a machine with a perfectly working OpenXR setup fails to
+/// dlopen. Tools like `openxr_runtime_list` don't hit this because they linked
+/// against the SONAME at build time.
+///
+/// So try the SONAME as well. Requiring a devel package in order to *run* an
+/// application is not a reasonable thing to ask.
+fn load_openxr_entry() -> Result<openxr::Entry, Box<dyn Error>> {
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[&str] = &["openxr_loader.dll"];
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: &[&str] = &["libopenxr_loader.dylib"];
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    const CANDIDATES: &[&str] = &["libopenxr_loader.so", "libopenxr_loader.so.1"];
+
+    let mut failures = Vec::new();
+    for candidate in CANDIDATES {
+        // SAFETY: loading a shared library runs its initializers. These are the
+        // standard OpenXR loader names, resolved through the dynamic loader's
+        // normal search path.
+        match unsafe { openxr::Entry::load_from(std::path::Path::new(candidate)) } {
+            Ok(entry) => return Ok(entry),
+            Err(err) => failures.push(format!("{candidate}: {err}")),
+        }
+    }
+
+    Err(format!(
+        "could not load the OpenXR loader (tried {})",
+        failures.join("; ")
+    )
+    .into())
 }
 
 /// Renders an extension list for logging.
