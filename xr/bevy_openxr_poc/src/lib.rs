@@ -750,6 +750,89 @@ fn create_reference_space(
     }
 }
 
+/// Near plane for the per-eye projections, in metres.
+///
+/// Closer than Bevy's 0.1 default: in a headset your hands come well inside
+/// 10cm, and reverse-Z gives up almost nothing for a near plane this small.
+pub const XR_NEAR: f32 = 0.05;
+
+/// Converts an OpenXR pose into a Bevy [`Transform`].
+///
+/// No axis juggling required: OpenXR and Bevy are both right-handed, Y-up,
+/// -Z-forward, and both store quaternions xyzw. This is a rename, not a
+/// conversion — which is worth stating explicitly, because it is exactly the
+/// kind of thing that gets "fixed" with a spurious negation later.
+pub fn transform_from_pose(pose: openxr::Posef) -> Transform {
+    Transform {
+        translation: Vec3::new(pose.position.x, pose.position.y, pose.position.z),
+        rotation: Quat::from_xyzw(
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ),
+        scale: Vec3::ONE,
+    }
+}
+
+/// Builds a `clip_from_view` matrix from an OpenXR field of view.
+///
+/// XR runtimes report **asymmetric** per-eye FOVs — the four half-angles are
+/// independent, and on most headsets the outer angle is wider than the inner
+/// one. Bevy's `PerspectiveProjection` cannot express that: it takes a single
+/// vertical FOV and an aspect ratio, which is symmetric by construction. So the
+/// matrix is built directly.
+///
+/// The convention is Bevy's: right-handed view space, infinite far plane,
+/// reverse-Z (near maps to 1, infinity to 0), NDC Z in `[0, 1]`. That is what
+/// `bevy_math::proj` (glam's RH DirectX projections) produces, and every depth
+/// comparison in Bevy's shaders assumes it. glam offers an off-centre `frustum`
+/// but only with a finite far plane, so the reverse-Z form is assembled here.
+pub fn clip_from_fov(fov: openxr::Fovf, near: f32) -> Mat4 {
+    let tan_left = ops::tan(fov.angle_left);
+    let tan_right = ops::tan(fov.angle_right);
+    let tan_up = ops::tan(fov.angle_up);
+    let tan_down = ops::tan(fov.angle_down);
+
+    let tan_width = tan_right - tan_left;
+    let tan_height = tan_up - tan_down;
+
+    Mat4::from_cols(
+        Vec4::new(2.0 / tan_width, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 2.0 / tan_height, 0.0, 0.0),
+        // The z column carries the frustum's off-centre shear. Symmetric FOVs
+        // zero both terms and this collapses to the standard matrix.
+        Vec4::new(
+            (tan_right + tan_left) / tan_width,
+            (tan_up + tan_down) / tan_height,
+            0.0,
+            -1.0,
+        ),
+        Vec4::new(0.0, 0.0, near, 0.0),
+    )
+}
+
+/// The widest symmetric FOV enclosing every supplied view.
+///
+/// The per-eye projections live on [`MultiviewSubview`](bevy::camera::MultiviewSubview),
+/// but Bevy still frustum-culls against the *camera's* own `Projection`. Left at
+/// the default 45°, a camera would cull geometry the eyes can actually see, and
+/// things would pop out at the periphery. This produces a symmetric projection
+/// guaranteed to contain both eyes' frusta, so culling never removes anything
+/// visible. It over-includes slightly, which costs a few draws and is the
+/// correct direction to err.
+pub fn enclosing_fov(views: &[openxr::View]) -> Option<openxr::Fovf> {
+    views.iter().map(|view| view.fov).reduce(|a, b| {
+        let widest = |x: f32, y: f32| if x.abs() > y.abs() { x } else { y };
+        openxr::Fovf {
+            angle_left: widest(a.angle_left, b.angle_left),
+            angle_right: widest(a.angle_right, b.angle_right),
+            angle_up: widest(a.angle_up, b.angle_up),
+            angle_down: widest(a.angle_down, b.angle_down),
+        }
+    })
+}
+
 /// A symmetric field of view matching Bevy's default perspective projection.
 ///
 /// A placeholder for what `xrLocateViews` reports. Real runtimes supply
@@ -997,5 +1080,170 @@ fn xr_acquire_image(
                 swapchain.views.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::math::proj;
+
+    /// A symmetric FOV, expressed the way a runtime would report it.
+    fn symmetric(vertical_fov: f32, aspect: f32) -> openxr::Fovf {
+        let half_vertical = vertical_fov / 2.0;
+        let half_horizontal = ops::atan(ops::tan(half_vertical) * aspect);
+        openxr::Fovf {
+            angle_left: -half_horizontal,
+            angle_right: half_horizontal,
+            angle_up: half_vertical,
+            angle_down: -half_vertical,
+        }
+    }
+
+    /// The hand-built matrix must collapse to Bevy's own for the symmetric
+    /// case. This is the anchor: it pins the convention (right-handed,
+    /// infinite far, reverse-Z, NDC Z in [0,1]) against the exact function
+    /// `PerspectiveProjection` uses, so the asymmetric generalisation can't
+    /// silently drift into a different convention.
+    #[test]
+    fn symmetric_fov_matches_bevys_perspective() {
+        for &(fov, aspect) in &[
+            (core::f32::consts::PI / 4.0, 16.0 / 9.0),
+            (core::f32::consts::PI / 2.0, 896.0 / 1007.0),
+            (1.7, 1.0),
+        ] {
+            let ours = clip_from_fov(symmetric(fov, aspect), XR_NEAR);
+            let bevys = proj::perspective_infinite_reverse(fov, aspect, XR_NEAR);
+
+            assert!(
+                ours.abs_diff_eq(bevys, 1e-5),
+                "fov={fov} aspect={aspect}\nours:  {ours:?}\nbevy: {bevys:?}"
+            );
+        }
+    }
+
+    /// Reverse-Z: a point on the near plane lands at NDC z = 1, and distance
+    /// drives z toward 0. Getting this backwards renders nothing and looks
+    /// like a culling bug.
+    #[test]
+    fn reverse_z_maps_near_to_one() {
+        let clip_from_view = clip_from_fov(symmetric(core::f32::consts::PI / 2.0, 1.0), XR_NEAR);
+
+        // View space looks down -Z, so the near plane is at z = -XR_NEAR.
+        let near_point = clip_from_view * Vec4::new(0.0, 0.0, -XR_NEAR, 1.0);
+        assert!((near_point.z / near_point.w - 1.0).abs() < 1e-5);
+
+        let far_point = clip_from_view * Vec4::new(0.0, 0.0, -1000.0, 1.0);
+        let ndc_z = far_point.z / far_point.w;
+        assert!((0.0..0.001).contains(&ndc_z), "distant z was {ndc_z}");
+    }
+
+    /// An asymmetric FOV must put the frustum edges exactly on the NDC edges.
+    /// This is the property the symmetric test cannot check, and the one that
+    /// matters for a real headset: the outer half-angle is wider than the
+    /// inner one, and a symmetric approximation shifts the whole image.
+    #[test]
+    fn asymmetric_fov_maps_frustum_edges_to_ndc_edges() {
+        // Deliberately lopsided, in the direction a left eye actually reports.
+        let fov = openxr::Fovf {
+            angle_left: -0.95,
+            angle_right: 0.75,
+            angle_up: 0.8,
+            angle_down: -0.9,
+        };
+        let clip_from_view = clip_from_fov(fov, XR_NEAR);
+
+        // A point on the left edge of the frustum, one metre out.
+        let depth = 1.0f32;
+        let edge = |angle: f32| depth * ops::tan(angle);
+
+        let left = clip_from_view * Vec4::new(edge(fov.angle_left), 0.0, -depth, 1.0);
+        assert!(
+            (left.x / left.w + 1.0).abs() < 1e-5,
+            "left edge -> {}",
+            left.x / left.w
+        );
+
+        let right = clip_from_view * Vec4::new(edge(fov.angle_right), 0.0, -depth, 1.0);
+        assert!(
+            (right.x / right.w - 1.0).abs() < 1e-5,
+            "right edge -> {}",
+            right.x / right.w
+        );
+
+        let up = clip_from_view * Vec4::new(0.0, edge(fov.angle_up), -depth, 1.0);
+        assert!(
+            (up.y / up.w - 1.0).abs() < 1e-5,
+            "up edge -> {}",
+            up.y / up.w
+        );
+
+        let down = clip_from_view * Vec4::new(0.0, edge(fov.angle_down), -depth, 1.0);
+        assert!(
+            (down.y / down.w + 1.0).abs() < 1e-5,
+            "down edge -> {}",
+            down.y / down.w
+        );
+    }
+
+    /// OpenXR and Bevy share a coordinate convention, so this is a rename.
+    /// The test exists to catch someone "correcting" it with a negation.
+    #[test]
+    fn pose_conversion_is_component_wise() {
+        let pose = openxr::Posef {
+            position: openxr::Vector3f {
+                x: 0.032,
+                y: 1.6,
+                z: -0.25,
+            },
+            orientation: openxr::Quaternionf {
+                x: 0.1,
+                y: 0.2,
+                z: 0.3,
+                w: 0.927,
+            },
+        };
+        let transform = transform_from_pose(pose);
+
+        assert_eq!(transform.translation, Vec3::new(0.032, 1.6, -0.25));
+        assert_eq!(transform.rotation, Quat::from_xyzw(0.1, 0.2, 0.3, 0.927));
+        assert_eq!(transform.scale, Vec3::ONE);
+    }
+
+    /// The culling projection must contain both eyes, taking the wider
+    /// half-angle on every side rather than either eye's own.
+    #[test]
+    fn enclosing_fov_takes_the_widest_of_each_side() {
+        let views = [
+            openxr::View {
+                pose: openxr::Posef::IDENTITY,
+                fov: openxr::Fovf {
+                    angle_left: -0.95,
+                    angle_right: 0.75,
+                    angle_up: 0.8,
+                    angle_down: -0.7,
+                },
+            },
+            openxr::View {
+                pose: openxr::Posef::IDENTITY,
+                fov: openxr::Fovf {
+                    angle_left: -0.75,
+                    angle_right: 0.95,
+                    angle_up: 0.7,
+                    angle_down: -0.9,
+                },
+            },
+        ];
+
+        let fov = enclosing_fov(&views).expect("two views were supplied");
+        assert_eq!(fov.angle_left, -0.95);
+        assert_eq!(fov.angle_right, 0.95);
+        assert_eq!(fov.angle_up, 0.8);
+        assert_eq!(fov.angle_down, -0.9);
+    }
+
+    #[test]
+    fn enclosing_fov_of_nothing_is_none() {
+        assert!(enclosing_fov(&[]).is_none());
     }
 }
