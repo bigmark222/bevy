@@ -55,6 +55,7 @@
 use ash::vk::Handle as _;
 use bevy::{
     camera::ManualTextureViewHandle,
+    math::ops,
     prelude::*,
     render::{
         render_resource::{
@@ -130,6 +131,14 @@ impl Default for XrFrameLoop {
         }
     }
 }
+
+/// The space the composition layer's per-eye poses are expressed in.
+///
+/// `xrEndFrame` will not accept a projection layer without one. `STAGE` is
+/// floor-level room scale, which is what a standing scene wants; `LOCAL` is the
+/// always-supported fallback, centred on wherever the headset was at startup.
+#[derive(Resource)]
+pub struct XrReferenceSpace(pub openxr::Space);
 
 /// A frame that has been begun but not yet submitted.
 struct InFlightFrame {
@@ -297,6 +306,13 @@ impl Plugin for OpenXrPlugin {
                 app.insert_resource(swapchain);
             }
             Err(err) => error!("failed to wrap the OpenXR swapchain: {err}"),
+        }
+
+        match create_reference_space(&session.session) {
+            Ok(space) => {
+                app.insert_resource(space);
+            }
+            Err(err) => error!("failed to create a reference space: {err}"),
         }
 
         app.insert_resource(session);
@@ -709,6 +725,50 @@ fn create_session(app: &App) -> Result<OpenXrSession, Box<dyn Error>> {
     })
 }
 
+/// Creates the reference space the composition layer's poses are relative to.
+///
+/// `STAGE` is preferred — it puts the origin on the floor, matching a scene
+/// authored in metres with the camera at eye height. Not every runtime offers
+/// it, so `LOCAL` is the fallback; every runtime is required to support that.
+fn create_reference_space(
+    session: &openxr::Session<openxr::Vulkan>,
+) -> Result<XrReferenceSpace, Box<dyn Error>> {
+    match session.create_reference_space(openxr::ReferenceSpaceType::STAGE, openxr::Posef::IDENTITY)
+    {
+        Ok(space) => {
+            info!("using a STAGE reference space (floor-level origin)");
+            Ok(XrReferenceSpace(space))
+        }
+        Err(stage_err) => {
+            warn!("STAGE reference space unavailable ({stage_err}); falling back to LOCAL");
+            let space = session.create_reference_space(
+                openxr::ReferenceSpaceType::LOCAL,
+                openxr::Posef::IDENTITY,
+            )?;
+            Ok(XrReferenceSpace(space))
+        }
+    }
+}
+
+/// A symmetric field of view matching Bevy's default perspective projection.
+///
+/// A placeholder for what `xrLocateViews` reports. Real runtimes supply
+/// *asymmetric* per-eye FOVs, and this and the camera's `MultiviewSubview`
+/// projections are two halves of the same lie — step 3 replaces both together.
+fn placeholder_fov(resolution: UVec2) -> openxr::Fovf {
+    // `PerspectiveProjection::default().fov` is the vertical angle.
+    let half_vertical = core::f32::consts::PI / 8.0;
+    let aspect = resolution.x as f32 / resolution.y as f32;
+    let half_horizontal = ops::atan(ops::tan(half_vertical) * aspect);
+
+    openxr::Fovf {
+        angle_left: -half_horizontal,
+        angle_right: half_horizontal,
+        angle_up: half_vertical,
+        angle_down: -half_vertical,
+    }
+}
+
 /// Submits the frame begun on the previous tick.
 ///
 /// This runs at the *top* of the frame rather than after rendering because
@@ -721,25 +781,74 @@ fn create_session(app: &App) -> Result<OpenXrSession, Box<dyn Error>> {
 fn xr_submit_frame(
     mut session: ResMut<OpenXrSession>,
     swapchain: Option<ResMut<OpenXrSwapchain>>,
+    space: Option<Res<XrReferenceSpace>>,
     mut frame_loop: ResMut<XrFrameLoop>,
 ) {
     let Some(in_flight) = frame_loop.in_flight.take() else {
         return;
     };
 
-    if let (true, Some(mut swapchain)) = (in_flight.acquired, swapchain)
+    let mut swapchain = swapchain.filter(|_| in_flight.acquired);
+
+    // Release before submitting: `xrEndFrame` may only reference an image the
+    // runtime owns again.
+    if let Some(swapchain) = swapchain.as_mut()
         && let Err(err) = swapchain.swapchain.release_image()
     {
         error!("xrReleaseSwapchainImage failed: {err}");
     }
 
-    // Step 4 submits no layers: this proves the loop runs and the session stays
-    // healthy. The projection layer that actually shows the rendered image
-    // arrives in the next commit.
+    // One projection view per eye, each pointing at its own array layer of the
+    // single stereo swapchain image. This is where multiview pays off: both
+    // eyes were rendered in one pass into one texture, and the compositor is
+    // handed two slices of it.
+    //
+    // The poses are identity because `xrLocateViews` isn't wired up yet, so the
+    // runtime will reproject as though the head never moved. The image is
+    // present and wrong, which is exactly what this step is proving.
+    let views: Vec<_> = match (swapchain.as_deref(), space.as_deref()) {
+        (Some(swapchain), Some(_)) => (0..swapchain.view_count)
+            .map(|layer| {
+                openxr::CompositionLayerProjectionView::new()
+                    .pose(openxr::Posef::IDENTITY)
+                    .fov(placeholder_fov(swapchain.resolution))
+                    .sub_image(
+                        openxr::SwapchainSubImage::new()
+                            .swapchain(&swapchain.swapchain)
+                            .image_array_index(layer)
+                            .image_rect(openxr::Rect2Di {
+                                offset: openxr::Offset2Di { x: 0, y: 0 },
+                                extent: openxr::Extent2Di {
+                                    width: swapchain.resolution.x as i32,
+                                    height: swapchain.resolution.y as i32,
+                                },
+                            }),
+                    )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    // `xrEndFrame` is owed unconditionally once `xrBeginFrame` was called —
+    // with no layers when there is nothing to show. Skipping it is the usual
+    // way this loop wedges.
+    let projection;
+    let submitted;
+    let layers: &[&openxr::CompositionLayerBase<'_, openxr::Vulkan>] = match space.as_deref() {
+        Some(space) if !views.is_empty() => {
+            projection = openxr::CompositionLayerProjection::new()
+                .space(&space.0)
+                .views(&views);
+            submitted = [&*projection];
+            &submitted
+        }
+        _ => &[],
+    };
+
     if let Err(err) = session.frame_stream.end(
         in_flight.frame_state.predicted_display_time,
         openxr::EnvironmentBlendMode::OPAQUE,
-        &[],
+        layers,
     ) {
         error!("xrEndFrame failed: {err}");
     }
