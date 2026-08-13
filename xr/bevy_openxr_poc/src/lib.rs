@@ -136,7 +136,7 @@ impl Default for XrFrameLoop {
 ///
 /// `xrEndFrame` will not accept a projection layer without one. `STAGE` is
 /// floor-level room scale, which is what a standing scene wants; `LOCAL` is the
-/// always-supported fallback, centred on wherever the headset was at startup.
+/// always-supported fallback, centered on wherever the headset was at startup.
 #[derive(Resource)]
 pub struct XrReferenceSpace(pub openxr::Space);
 
@@ -149,7 +149,7 @@ struct InFlightFrame {
     acquired: bool,
     /// What `xrLocateViews` reported for this frame's predicted display time.
     ///
-    /// The composition layer **must** declare the same poses and FOVs the
+    /// The composition layer **must** declare the same poses and FOV values the
     /// image was rendered with. Submitting anything else tells the compositor
     /// to reproject from a viewpoint that was never drawn, which shows up as
     /// the world sliding around as the head moves. Empty until
@@ -795,7 +795,7 @@ fn create_session(app: &App) -> Result<OpenXrSession, Box<dyn Error>> {
 /// Creates the reference space the composition layer's poses are relative to.
 ///
 /// `STAGE` is preferred — it puts the origin on the floor, matching a scene
-/// authored in metres with the camera at eye height. Not every runtime offers
+/// authored in meters with the camera at eye height. Not every runtime offers
 /// it, so `LOCAL` is the fallback; every runtime is required to support that.
 fn create_reference_space(
     session: &openxr::Session<openxr::Vulkan>,
@@ -817,7 +817,7 @@ fn create_reference_space(
     }
 }
 
-/// Near plane for the per-eye projections, in metres.
+/// Near plane for the per-eye projections, in meters.
 ///
 /// Closer than Bevy's 0.1 default: in a headset your hands come well inside
 /// 10cm, and reverse-Z gives up almost nothing for a near plane this small.
@@ -844,7 +844,7 @@ pub fn transform_from_pose(pose: openxr::Posef) -> Transform {
 
 /// Builds a `clip_from_view` matrix from an OpenXR field of view.
 ///
-/// XR runtimes report **asymmetric** per-eye FOVs — the four half-angles are
+/// XR runtimes report **asymmetric** per-eye FOV values — the four half-angles are
 /// independent, and on most headsets the outer angle is wider than the inner
 /// one. Bevy's `PerspectiveProjection` cannot express that: it takes a single
 /// vertical FOV and an aspect ratio, which is symmetric by construction. So the
@@ -853,7 +853,7 @@ pub fn transform_from_pose(pose: openxr::Posef) -> Transform {
 /// The convention is Bevy's: right-handed view space, infinite far plane,
 /// reverse-Z (near maps to 1, infinity to 0), NDC Z in `[0, 1]`. That is what
 /// `bevy_math::proj` (glam's RH DirectX projections) produces, and every depth
-/// comparison in Bevy's shaders assumes it. glam offers an off-centre `frustum`
+/// comparison in Bevy's shaders assumes it. glam offers an off-center `frustum`
 /// but only with a finite far plane, so the reverse-Z form is assembled here.
 pub fn clip_from_fov(fov: openxr::Fovf, near: f32) -> Mat4 {
     let tan_left = ops::tan(fov.angle_left);
@@ -867,7 +867,7 @@ pub fn clip_from_fov(fov: openxr::Fovf, near: f32) -> Mat4 {
     Mat4::from_cols(
         Vec4::new(2.0 / tan_width, 0.0, 0.0, 0.0),
         Vec4::new(0.0, 2.0 / tan_height, 0.0, 0.0),
-        // The z column carries the frustum's off-centre shear. Symmetric FOVs
+        // The z column carries the frustum's off-center shear. Symmetric FOV values
         // zero both terms and this collapses to the standard matrix.
         Vec4::new(
             (tan_right + tan_left) / tan_width,
@@ -921,7 +921,7 @@ pub fn culling_fov_y(enclosing: openxr::Fovf, aspect_ratio: f32) -> f32 {
 /// `xrLocateViews` reports. Every frame after that overwrites it.
 ///
 /// A placeholder for what `xrLocateViews` reports. Real runtimes supply
-/// *asymmetric* per-eye FOVs, and this and the camera's `MultiviewSubview`
+/// *asymmetric* per-eye FOV values, and this and the camera's `MultiviewSubview`
 /// projections are two halves of the same lie — step 3 replaces both together.
 pub fn placeholder_fov(resolution: UVec2) -> openxr::Fovf {
     // `PerspectiveProjection::default().fov` is the vertical angle.
@@ -1260,7 +1260,7 @@ pub struct DisparitySample {
     /// correct stereo: an object ahead of you sits further right in your left
     /// eye's view.
     pub disparity: f32,
-    /// `disparity * depth`, which equals the **eye separation in metres**.
+    /// `disparity * depth`, which equals the **eye separation in meters**.
     /// Constant across depths iff disparity obeys the 1/depth law it
     /// physically must — this is the number that matters.
     pub invariant: f32,
@@ -1273,7 +1273,7 @@ pub struct DisparitySample {
 /// that never actually moved apart all still produce two visibly different
 /// pictures. Disparity has to fall off as 1/depth, so `disparity * depth` is
 /// constant — measuring that turns "looks about right" into a number. Here that
-/// constant is the eye separation itself, in metres, which is independently
+/// constant is the eye separation itself, in meters, which is independently
 /// checkable against the IPD the runtime reports.
 ///
 /// **Measured in tangent space, deliberately not in NDC.** An earlier version
@@ -1283,7 +1283,7 @@ pub struct DisparitySample {
 /// exists — each eye's forward axis does not land at NDC x = 0. That puts a
 /// constant offset between the eyes which never decays with distance, so the
 /// measurement was `C + k/depth` rather than `k/depth`. Monado's simulated HMD
-/// has symmetric FOVs, so `C` was zero there and the mistake stayed hidden.
+/// has symmetric FOV values, so `C` was zero there and the mistake stayed hidden.
 /// Tangent space removes the projection from the measurement entirely, leaving
 /// only what is being tested: where the eyes are.
 ///
@@ -1329,7 +1329,7 @@ pub fn measure_disparity(
 /// asymmetric ones a real headset reports. Logged because it is precisely the
 /// term that made the NDC-based disparity measurement wrong, and seeing it
 /// stated is how that stays fixed.
-pub fn frustum_centre_offset(left: &EyeGeometry, right: &EyeGeometry) -> f32 {
+pub fn frustum_center_offset(left: &EyeGeometry, right: &EyeGeometry) -> f32 {
     // A point infinitely far along -Z projects to x = -m.z_axis.x (w = 1).
     -left.clip_from_view.z_axis.x + right.clip_from_view.z_axis.x
 }
@@ -1379,9 +1379,9 @@ fn xr_report_disparity(
         let samples = measure_disparity(&left, &right, &[0.5, 1.0, 2.0, 4.0]);
 
         info!(
-            "stereo disparity check (IPD {:.1} mm, frustum-centre offset {:+.4} ndc):",
+            "stereo disparity check (IPD {:.1} mm, frustum-center offset {:+.4} ndc):",
             ipd * 1000.0,
-            frustum_centre_offset(&left, &right)
+            frustum_center_offset(&left, &right)
         );
         for sample in &samples {
             info!(
@@ -1455,7 +1455,7 @@ mod tests {
     /// The hand-built matrix must collapse to Bevy's own for the symmetric
     /// case. This is the anchor: it pins the convention (right-handed,
     /// infinite far, reverse-Z, NDC Z in [0,1]) against the exact function
-    /// `PerspectiveProjection` uses, so the asymmetric generalisation can't
+    /// `PerspectiveProjection` uses, so the asymmetric generalization can't
     /// silently drift into a different convention.
     #[test]
     fn symmetric_fov_matches_bevys_perspective() {
@@ -1505,7 +1505,7 @@ mod tests {
         };
         let clip_from_view = clip_from_fov(fov, XR_NEAR);
 
-        // A point on the left edge of the frustum, one metre out.
+        // A point on the left edge of the frustum, one meter out.
         let depth = 1.0f32;
         let edge = |angle: f32| depth * ops::tan(angle);
 
@@ -1664,7 +1664,7 @@ mod tests {
         // And halving the distance must double the separation.
         assert!((samples[0].disparity / samples[1].disparity - 2.0).abs() < 1e-4);
 
-        // The invariant is the eye separation itself, in metres.
+        // The invariant is the eye separation itself, in meters.
         for sample in &samples {
             assert!(
                 (sample.invariant - 2.0 * HALF_IPD).abs() < 1e-5,
@@ -1679,8 +1679,8 @@ mod tests {
     ///
     /// Measuring in NDC, this exact configuration reported a 106% variation
     /// against Meta's runtime on geometry that was correct — each eye's
-    /// forward axis lands off-centre, adding a constant that never decays with
-    /// distance. Monado's symmetric FOVs hid it. Tangent space is immune, and
+    /// forward axis lands off-center, adding a constant that never decays with
+    /// distance. Monado's symmetric FOV values hid it. Tangent space is immune, and
     /// the invariant must still come out as the eye separation.
     #[test]
     fn asymmetric_frusta_do_not_disturb_disparity() {
@@ -1708,8 +1708,8 @@ mod tests {
         let left = eye(-HALF_IPD, -outer, inner);
         let right = eye(HALF_IPD, -inner, outer);
 
-        // The frusta really are off-centre — otherwise this proves nothing.
-        assert!(frustum_centre_offset(&left, &right).abs() > 0.1);
+        // The frusta really are off-center — otherwise this proves nothing.
+        assert!(frustum_center_offset(&left, &right).abs() > 0.1);
 
         let samples = measure_disparity(&left, &right, &[0.5, 1.0, 2.0, 4.0]);
         for sample in &samples {
@@ -1721,14 +1721,14 @@ mod tests {
         }
     }
 
-    /// Symmetric frusta have no centre offset; asymmetric ones do.
+    /// Symmetric frusta have no center offset; asymmetric ones do.
     #[test]
-    fn frustum_centre_offset_is_zero_only_when_symmetric() {
+    fn frustum_center_offset_is_zero_only_when_symmetric() {
         let symmetric_eye = EyeGeometry {
             world_from_view: Mat4::IDENTITY,
             clip_from_view: clip_from_fov(symmetric(core::f32::consts::PI / 2.0, 1.0), XR_NEAR),
         };
-        assert!(frustum_centre_offset(&symmetric_eye, &symmetric_eye).abs() < 1e-6);
+        assert!(frustum_center_offset(&symmetric_eye, &symmetric_eye).abs() < 1e-6);
 
         let lopsided = |angle_left: f32, angle_right: f32| EyeGeometry {
             world_from_view: Mat4::IDENTITY,
@@ -1742,7 +1742,7 @@ mod tests {
                 XR_NEAR,
             ),
         };
-        assert!(frustum_centre_offset(&lopsided(-0.95, 0.72), &lopsided(-0.72, 0.95)).abs() > 0.1);
+        assert!(frustum_center_offset(&lopsided(-0.95, 0.72), &lopsided(-0.72, 0.95)).abs() > 0.1);
     }
 
     /// Eyes at the same place produce no disparity — the degenerate case the
