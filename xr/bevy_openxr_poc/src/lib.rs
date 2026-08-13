@@ -54,7 +54,7 @@
 
 use ash::vk::Handle as _;
 use bevy::{
-    camera::{ManualTextureViewHandle, Multiview, PerspectiveProjection, Projection},
+    camera::{ManualTextureViewHandle, Multiview},
     math::ops,
     prelude::*,
     render::{
@@ -879,44 +879,6 @@ pub fn clip_from_fov(fov: openxr::Fovf, near: f32) -> Mat4 {
     )
 }
 
-/// The widest symmetric FOV enclosing every supplied view.
-///
-/// The per-eye projections live on [`MultiviewSubview`](bevy::camera::MultiviewSubview),
-/// but Bevy still frustum-culls against the *camera's* own `Projection`. Left at
-/// the default 45°, a camera would cull geometry the eyes can actually see, and
-/// things would pop out at the periphery. This produces a symmetric projection
-/// guaranteed to contain both eyes' frusta, so culling never removes anything
-/// visible. It over-includes slightly, which costs a few draws and is the
-/// correct direction to err.
-pub fn enclosing_fov(views: &[openxr::View]) -> Option<openxr::Fovf> {
-    views.iter().map(|view| view.fov).reduce(|a, b| {
-        let widest = |x: f32, y: f32| if x.abs() > y.abs() { x } else { y };
-        openxr::Fovf {
-            angle_left: widest(a.angle_left, b.angle_left),
-            angle_right: widest(a.angle_right, b.angle_right),
-            angle_up: widest(a.angle_up, b.angle_up),
-            angle_down: widest(a.angle_down, b.angle_down),
-        }
-    })
-}
-
-/// The vertical FOV a symmetric projection needs to contain `enclosing`.
-///
-/// Setting `aspect_ratio` on the camera's [`Projection`] directly is futile:
-/// `camera_system` calls `CameraProjection::update` every frame and overwrites
-/// it from the render target's dimensions. Only the vertical angle survives, so
-/// the horizontal requirement has to be folded into it — widening vertically
-/// until the frustum is at least as wide horizontally as the eyes need.
-pub fn culling_fov_y(enclosing: openxr::Fovf, aspect_ratio: f32) -> f32 {
-    let half_vertical = enclosing.angle_up.abs().max(enclosing.angle_down.abs());
-    let half_horizontal = enclosing.angle_left.abs().max(enclosing.angle_right.abs());
-
-    // What vertical half-angle yields `half_horizontal` at this aspect ratio.
-    let needed_for_width = ops::atan(ops::tan(half_horizontal) / aspect_ratio);
-
-    2.0 * half_vertical.max(needed_for_width)
-}
-
 /// A symmetric field of view, used only to seed the camera before the first
 /// `xrLocateViews` reports. Every frame after that overwrites it.
 ///
@@ -1135,9 +1097,8 @@ fn xr_begin_frame(mut session: ResMut<OpenXrSession>, mut frame_loop: ResMut<XrF
 fn xr_locate_views(
     session: Res<OpenXrSession>,
     space: Res<XrReferenceSpace>,
-    swapchain: Res<OpenXrSwapchain>,
     mut frame_loop: ResMut<XrFrameLoop>,
-    mut cameras: Query<(&mut Multiview, &mut Projection), With<XrCamera>>,
+    mut cameras: Query<&mut Multiview, With<XrCamera>>,
 ) {
     let Some(in_flight) = frame_loop.in_flight.as_mut() else {
         return;
@@ -1164,7 +1125,7 @@ fn xr_locate_views(
         return;
     }
 
-    for (mut multiview, mut projection) in &mut cameras {
+    for mut multiview in &mut cameras {
         if multiview.views.len() != views.len() {
             warn!(
                 "camera has {} subview(s) but the runtime located {}; skipping",
@@ -1181,16 +1142,6 @@ fn xr_locate_views(
             // relative to it.
             subview.view_from_camera = transform_from_pose(view.pose);
             subview.clip_from_view = clip_from_fov(view.fov, XR_NEAR);
-        }
-
-        // Bevy frustum-culls against this, not against the per-eye
-        // projections — see `enclosing_fov`.
-        if let Some(enclosing) = enclosing_fov(&views) {
-            *projection = Projection::Perspective(PerspectiveProjection {
-                fov: culling_fov_y(enclosing, swapchain.aspect_ratio()),
-                near: XR_NEAR,
-                ..default()
-            });
         }
     }
 
@@ -1560,70 +1511,6 @@ mod tests {
         assert_eq!(transform.translation, Vec3::new(0.032, 1.6, -0.25));
         assert_eq!(transform.rotation, Quat::from_xyzw(0.1, 0.2, 0.3, 0.927));
         assert_eq!(transform.scale, Vec3::ONE);
-    }
-
-    /// The culling projection must contain both eyes, taking the wider
-    /// half-angle on every side rather than either eye's own.
-    #[test]
-    fn enclosing_fov_takes_the_widest_of_each_side() {
-        let views = [
-            openxr::View {
-                pose: openxr::Posef::IDENTITY,
-                fov: openxr::Fovf {
-                    angle_left: -0.95,
-                    angle_right: 0.75,
-                    angle_up: 0.8,
-                    angle_down: -0.7,
-                },
-            },
-            openxr::View {
-                pose: openxr::Posef::IDENTITY,
-                fov: openxr::Fovf {
-                    angle_left: -0.75,
-                    angle_right: 0.95,
-                    angle_up: 0.7,
-                    angle_down: -0.9,
-                },
-            },
-        ];
-
-        let fov = enclosing_fov(&views).expect("two views were supplied");
-        assert_eq!(fov.angle_left, -0.95);
-        assert_eq!(fov.angle_right, 0.95);
-        assert_eq!(fov.angle_up, 0.8);
-        assert_eq!(fov.angle_down, -0.9);
-    }
-
-    #[test]
-    fn enclosing_fov_of_nothing_is_none() {
-        assert!(enclosing_fov(&[]).is_none());
-    }
-
-    /// The culling FOV must widen vertically to cover the horizontal
-    /// requirement, because `camera_system` overwrites any aspect ratio we set.
-    #[test]
-    fn culling_fov_widens_for_a_narrow_target() {
-        let fov = openxr::Fovf {
-            angle_left: -1.0,
-            angle_right: 1.0,
-            angle_up: 0.5,
-            angle_down: -0.5,
-        };
-
-        // A portrait target (the Quest/Monado shape) forces vertical widening:
-        // 1.0 rad of horizontal half-angle needs more than 0.5 vertical.
-        let portrait = culling_fov_y(fov, 896.0 / 1007.0);
-        let needed = 2.0 * ops::atan(ops::tan(1.0f32) / (896.0 / 1007.0));
-        assert!(
-            (portrait - needed).abs() < 1e-5,
-            "got {portrait}, needed {needed}"
-        );
-        assert!(portrait > 2.0 * 0.5);
-
-        // A very wide target already covers the horizontal span, so the
-        // vertical half-angle governs and is left alone.
-        let wide = culling_fov_y(fov, 100.0);
-        assert!((wide - 1.0).abs() < 1e-5, "got {wide}");
     }
 
     /// Disparity must fall off as 1/depth. This pins the law that
