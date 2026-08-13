@@ -415,7 +415,28 @@ fn init_openxr() -> Result<OpenXrInit, Box<dyn Error>> {
         &[],
     )?;
 
+    // Which runtime actually answered, and which headset it found. Worth
+    // printing before anything else can fail: on Windows the active runtime is
+    // a registry key that SteamVR is fond of claiming, so "why is nothing in my
+    // Quest" is often really "you are talking to SteamVR". Reading it here
+    // means the app's own output answers that, rather than a separate tool.
+    match instance.properties() {
+        Ok(properties) => eprintln!(
+            "[openxr] runtime: {} {}",
+            properties.runtime_name, properties.runtime_version
+        ),
+        Err(err) => eprintln!("[openxr] could not read runtime properties: {err}"),
+    }
+
     let system = instance.system(openxr::FormFactor::HEAD_MOUNTED_DISPLAY)?;
+
+    match instance.system_properties(system) {
+        Ok(properties) => eprintln!(
+            "[openxr] system: '{}' (vendor 0x{:04x})",
+            properties.system_name, properties.vendor_id
+        ),
+        Err(err) => eprintln!("[openxr] could not read system properties: {err}"),
+    }
 
     // The spec requires this be called before session creation, and it reports
     // the Vulkan version range the runtime supports.
