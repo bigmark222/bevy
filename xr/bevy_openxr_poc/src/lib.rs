@@ -623,9 +623,21 @@ fn create_swapchain(
         .map(|image| {
             // SAFETY: `image` is a live `VkImage` owned by the OpenXR runtime,
             // created with the dimensions, format and layer count described
-            // here. `TextureMemory::External` and the absent drop callback are
-            // what keep wgpu from freeing memory it does not own — the runtime
-            // destroys these with the swapchain.
+            // here.
+            //
+            // Both of the last two arguments are load-bearing, and they guard
+            // different things:
+            //
+            // - `TextureMemory::External` stops wgpu freeing the backing
+            //   *memory*, which it does not own.
+            // - the `Some(..)` drop callback stops wgpu destroying the *image
+            //   handle*. `destroy_texture` calls `vkDestroyImage` whenever the
+            //   drop guard is absent, regardless of the memory variant
+            //   (wgpu-hal 30, `vulkan/device.rs`) — so passing `None` here
+            //   double-frees against `xrDestroySwapchain` and takes the process
+            //   out at shutdown with an access violation. The callback itself
+            //   has nothing to do: the runtime destroys these images with the
+            //   swapchain. Its presence is the whole point.
             let hal_texture = unsafe {
                 let hal_device = render_device
                     .as_hal::<Vulkan>()
@@ -644,7 +656,7 @@ fn create_swapchain(
                         memory_flags: wgpu::hal::MemoryFlags::empty(),
                         view_formats: vec![],
                     },
-                    None,
+                    Some(Box::new(|| {})),
                     wgpu::hal::vulkan::TextureMemory::External,
                 )
             };
@@ -1240,15 +1252,17 @@ pub struct EyeGeometry {
     pub clip_from_view: Mat4,
 }
 
-/// Horizontal separation of a point between the two eyes, in NDC.
+/// Horizontal separation of a point between the two eyes, in tangent space.
 #[derive(Clone, Copy, Debug)]
 pub struct DisparitySample {
     pub depth: f32,
-    /// Left eye's NDC x minus the right eye's. Positive for correct stereo:
-    /// an object ahead of you sits further right in your left eye's image.
+    /// Left eye's horizontal tangent minus the right eye's. Positive for
+    /// correct stereo: an object ahead of you sits further right in your left
+    /// eye's view.
     pub disparity: f32,
-    /// `disparity * depth`. Constant across depths iff disparity obeys the
-    /// 1/depth law it physically must — this is the number that matters.
+    /// `disparity * depth`, which equals the **eye separation in metres**.
+    /// Constant across depths iff disparity obeys the 1/depth law it
+    /// physically must — this is the number that matters.
     pub invariant: f32,
 }
 
@@ -1258,7 +1272,20 @@ pub struct DisparitySample {
 /// they differ **correctly**. A wrong pose scale, a swapped IPD sign, or eyes
 /// that never actually moved apart all still produce two visibly different
 /// pictures. Disparity has to fall off as 1/depth, so `disparity * depth` is
-/// constant — measuring that turns "looks about right" into a number.
+/// constant — measuring that turns "looks about right" into a number. Here that
+/// constant is the eye separation itself, in metres, which is independently
+/// checkable against the IPD the runtime reports.
+///
+/// **Measured in tangent space, deliberately not in NDC.** An earlier version
+/// of this used NDC x and reported a 106% variation against Meta's runtime on a
+/// scene that was in fact correct. With *asymmetric* per-eye frusta — which is
+/// the normal case on a real headset, and the entire reason [`clip_from_fov`]
+/// exists — each eye's forward axis does not land at NDC x = 0. That puts a
+/// constant offset between the eyes which never decays with distance, so the
+/// measurement was `C + k/depth` rather than `k/depth`. Monado's simulated HMD
+/// has symmetric FOVs, so `C` was zero there and the mistake stayed hidden.
+/// Tangent space removes the projection from the measurement entirely, leaving
+/// only what is being tested: where the eyes are.
 ///
 /// The head is taken as the midpoint of the two eyes, looking along the left
 /// eye's forward axis; the two eyes' orientations agree on every runtime that
@@ -1275,16 +1302,17 @@ pub fn measure_disparity(
     // Column 2 of a view matrix is +Z; view space looks down -Z.
     let forward = -left.world_from_view.z_axis.truncate().normalize();
 
-    let ndc_x = |eye: &EyeGeometry, point: Vec3| {
-        let clip = eye.clip_from_view * eye.world_from_view.inverse() * point.extend(1.0);
-        clip.x / clip.w
+    // Tangent of the horizontal angle from this eye's forward axis to `point`.
+    let tangent = |eye: &EyeGeometry, point: Vec3| {
+        let view = eye.world_from_view.inverse() * point.extend(1.0);
+        view.x / -view.z
     };
 
     depths
         .iter()
         .map(|&depth| {
             let point = head + forward * depth;
-            let disparity = ndc_x(left, point) - ndc_x(right, point);
+            let disparity = tangent(left, point) - tangent(right, point);
             DisparitySample {
                 depth,
                 disparity,
@@ -1292,6 +1320,18 @@ pub fn measure_disparity(
             }
         })
         .collect()
+}
+
+/// Where each eye's forward axis lands in its own NDC, and how far apart those
+/// are between the eyes.
+///
+/// Zero for symmetric frusta; non-zero and constant with distance for the
+/// asymmetric ones a real headset reports. Logged because it is precisely the
+/// term that made the NDC-based disparity measurement wrong, and seeing it
+/// stated is how that stays fixed.
+pub fn frustum_centre_offset(left: &EyeGeometry, right: &EyeGeometry) -> f32 {
+    // A point infinitely far along -Z projects to x = -m.z_axis.x (w = 1).
+    -left.clip_from_view.z_axis.x + right.clip_from_view.z_axis.x
 }
 
 /// Logs measured stereo disparity against the law it must obey.
@@ -1338,10 +1378,14 @@ fn xr_report_disparity(
 
         let samples = measure_disparity(&left, &right, &[0.5, 1.0, 2.0, 4.0]);
 
-        info!("stereo disparity check (IPD {:.1} mm):", ipd * 1000.0);
+        info!(
+            "stereo disparity check (IPD {:.1} mm, frustum-centre offset {:+.4} ndc):",
+            ipd * 1000.0,
+            frustum_centre_offset(&left, &right)
+        );
         for sample in &samples {
             info!(
-                "  depth {:>4.1} m -> disparity {:+.5} ndc, disparity*depth {:.5}",
+                "  depth {:>4.1} m -> disparity {:+.5} tan, disparity*depth {:.5} m",
                 sample.depth, sample.disparity, sample.invariant
             );
         }
@@ -1370,10 +1414,22 @@ fn xr_report_disparity(
                  eye poses rather than the projections.",
                 relative * 100.0
             );
+        } else if (mean - ipd).abs() > ipd * 0.02 {
+            // The invariant *is* the eye separation, so it has to agree with
+            // the distance between the poses. Disagreement means the two are
+            // being derived inconsistently.
+            error!(
+                "disparity*depth is a constant {:.1} mm but the eyes are {:.1} mm apart — \
+                 these are the same quantity and must agree",
+                mean * 1000.0,
+                ipd * 1000.0
+            );
         } else {
             info!(
-                "disparity*depth constant to {:.2}% — stereo geometry is correct",
-                relative * 100.0
+                "disparity*depth constant to {:.2}% and matches the {:.1} mm eye \
+                 separation — stereo geometry is correct",
+                relative * 100.0,
+                ipd * 1000.0
             );
         }
     }
@@ -1607,6 +1663,86 @@ mod tests {
 
         // And halving the distance must double the separation.
         assert!((samples[0].disparity / samples[1].disparity - 2.0).abs() < 1e-4);
+
+        // The invariant is the eye separation itself, in metres.
+        for sample in &samples {
+            assert!(
+                (sample.invariant - 2.0 * HALF_IPD).abs() < 1e-5,
+                "invariant {} should be the {} m eye separation",
+                sample.invariant,
+                2.0 * HALF_IPD
+            );
+        }
+    }
+
+    /// Regression: asymmetric per-eye frusta must not perturb the measurement.
+    ///
+    /// Measuring in NDC, this exact configuration reported a 106% variation
+    /// against Meta's runtime on geometry that was correct — each eye's
+    /// forward axis lands off-centre, adding a constant that never decays with
+    /// distance. Monado's symmetric FOVs hid it. Tangent space is immune, and
+    /// the invariant must still come out as the eye separation.
+    #[test]
+    fn asymmetric_frusta_do_not_disturb_disparity() {
+        const HALF_IPD: f32 = 0.0313;
+
+        // Outer half-angle wider than inner, mirrored per eye — a real
+        // headset's shape, and roughly the Quest 3's ~96 degrees horizontal.
+        let outer = 0.95f32;
+        let inner = 0.72f32;
+        let vertical = 0.90f32;
+
+        let eye = |x: f32, angle_left: f32, angle_right: f32| EyeGeometry {
+            world_from_view: Mat4::from_translation(Vec3::new(x, 0.0, 0.0)),
+            clip_from_view: clip_from_fov(
+                openxr::Fovf {
+                    angle_left,
+                    angle_right,
+                    angle_up: vertical,
+                    angle_down: -vertical,
+                },
+                XR_NEAR,
+            ),
+        };
+
+        let left = eye(-HALF_IPD, -outer, inner);
+        let right = eye(HALF_IPD, -inner, outer);
+
+        // The frusta really are off-centre — otherwise this proves nothing.
+        assert!(frustum_centre_offset(&left, &right).abs() > 0.1);
+
+        let samples = measure_disparity(&left, &right, &[0.5, 1.0, 2.0, 4.0]);
+        for sample in &samples {
+            assert!(sample.disparity > 0.0);
+            assert!(
+                (sample.invariant - 2.0 * HALF_IPD).abs() < 1e-5,
+                "asymmetry leaked into the measurement: {samples:?}"
+            );
+        }
+    }
+
+    /// Symmetric frusta have no centre offset; asymmetric ones do.
+    #[test]
+    fn frustum_centre_offset_is_zero_only_when_symmetric() {
+        let symmetric_eye = EyeGeometry {
+            world_from_view: Mat4::IDENTITY,
+            clip_from_view: clip_from_fov(symmetric(core::f32::consts::PI / 2.0, 1.0), XR_NEAR),
+        };
+        assert!(frustum_centre_offset(&symmetric_eye, &symmetric_eye).abs() < 1e-6);
+
+        let lopsided = |angle_left: f32, angle_right: f32| EyeGeometry {
+            world_from_view: Mat4::IDENTITY,
+            clip_from_view: clip_from_fov(
+                openxr::Fovf {
+                    angle_left,
+                    angle_right,
+                    angle_up: 0.9,
+                    angle_down: -0.9,
+                },
+                XR_NEAR,
+            ),
+        };
+        assert!(frustum_centre_offset(&lopsided(-0.95, 0.72), &lopsided(-0.72, 0.95)).abs() > 0.1);
     }
 
     /// Eyes at the same place produce no disparity — the degenerate case the
