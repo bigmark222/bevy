@@ -1,10 +1,9 @@
 //! Drives Bevy's multiview rendering from an OpenXR runtime.
 //!
-//! Steps so far: an `XrSession` created against Bevy's own `VkDevice` (step 1),
-//! the runtime's stereo swapchain wrapped as Bevy texture views (step 2), and
-//! the frame loop that drives them (step 4). Step 3 — per-eye poses and
-//! asymmetric projections from `xrLocateViews` — is still outstanding, so the
-//! projections here are symmetric placeholders and the head does not move.
+//! An `XrSession` created against Bevy's own `VkDevice` (step 1), the runtime's
+//! stereo swapchain wrapped as Bevy texture views (step 2), per-eye poses and
+//! asymmetric projections from `xrLocateViews` (step 3), and the frame loop
+//! that drives them (step 4).
 //!
 //! ```sh
 //! WGPU_BACKEND=vulkan cargo run -p bevy_openxr_poc
@@ -16,15 +15,14 @@
 //! ordinary Bevy app, which is the expected result on macOS.
 
 use bevy::{
-    camera::{CameraProjection, Multiview, MultiviewSubview, PerspectiveProjection, RenderTarget},
+    camera::{Multiview, MultiviewSubview, RenderTarget},
     prelude::*,
     render::pipelined_rendering::PipelinedRenderingPlugin,
 };
-use bevy_openxr_poc::{OpenXrInitPlugin, OpenXrPlugin, OpenXrSwapchain, XR_VIEW_HANDLE};
-
-/// Half of a 64mm interpupillary distance, in meters. A placeholder until
-/// `xrLocateViews` supplies real per-eye poses in step 3.
-const HALF_IPD: f32 = 0.032;
+use bevy_openxr_poc::{
+    clip_from_fov, placeholder_fov, OpenXrInitPlugin, OpenXrPlugin, OpenXrSwapchain, XrCamera,
+    XR_NEAR, XR_VIEW_HANDLE,
+};
 
 fn main() {
     App::new()
@@ -60,8 +58,8 @@ fn setup(
         return;
     };
 
-    // Something with enough depth structure to make parallax obvious once step
-    // 3 gives the eyes real poses.
+    // Enough depth structure to make stereo parallax obvious: cubes at
+    // increasing distance shift by visibly different amounts between the eyes.
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(8.0, 8.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
@@ -81,36 +79,29 @@ fn setup(
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Symmetric placeholder projections, one per eye. `aspect_ratio` has to be
-    // set explicitly: Bevy only maintains the camera's own `Projection`, so a
-    // projection built standalone for a subview never gets fixed up and would
-    // otherwise render a square frustum into a non-square target.
-    let clip_from_view = PerspectiveProjection {
-        aspect_ratio: swapchain.resolution.x as f32 / swapchain.resolution.y as f32,
-        ..default()
-    }
-    .get_clip_from_view();
-
-    let eyes = (0..swapchain.view_count)
-        .map(|index| {
-            // Left eye first, matching the OpenXR stereo view configuration's
-            // layer order.
-            let sign = if index == 0 { -1.0 } else { 1.0 };
-            MultiviewSubview {
-                view_from_camera: Transform::from_xyz(sign * HALF_IPD, 0.0, 0.0),
-                clip_from_view,
-            }
-        })
-        .collect();
+    // Seed values only. `xr_locate_views` overwrites both the pose and the
+    // projection of every subview each frame from `xrLocateViews`; these just
+    // keep frame zero from rendering through a degenerate matrix.
+    let seed = MultiviewSubview {
+        view_from_camera: Transform::IDENTITY,
+        clip_from_view: clip_from_fov(placeholder_fov(swapchain.resolution), XR_NEAR),
+    };
 
     commands.spawn((
         Camera3d::default(),
+        XrCamera,
         RenderTarget::TextureView(XR_VIEW_HANDLE),
-        Multiview { views: eyes },
+        Multiview {
+            views: vec![seed; swapchain.view_count as usize],
+        },
         // Multiview and MSAA don't combine: WGSL has no
         // `texture_depth_multisampled_2d_array`.
         Msaa::Off,
-        Transform::from_xyz(0.0, 1.6, 0.0).looking_at(Vec3::new(0.0, 0.5, -2.0), Vec3::Y),
+        // The camera is the play-space origin, not the head. Eye poses arrive
+        // from the runtime as subview offsets from here, already including head
+        // height, so this stays at the reference space's origin — moving it is
+        // how locomotion would work later.
+        Transform::IDENTITY,
     ));
 
     info!(

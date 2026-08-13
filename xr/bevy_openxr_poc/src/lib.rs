@@ -6,8 +6,8 @@
 //! Bevy ends up building, wrap the runtime's stereo swapchain as Bevy texture
 //! views, and drive it all from the OpenXR frame loop.
 //!
-//! Per-eye poses and asymmetric projections from `xrLocateViews` are not here
-//! yet, so the eyes are a fixed IPD offset and the head does not move.
+//! Per-eye poses and asymmetric projections come from `xrLocateViews` each
+//! frame, so the head tracks and each eye gets the runtime's own frustum.
 //!
 //! # Why this doesn't fork Bevy's renderer initialization
 //!
@@ -54,7 +54,7 @@
 
 use ash::vk::Handle as _;
 use bevy::{
-    camera::ManualTextureViewHandle,
+    camera::{ManualTextureViewHandle, Multiview, PerspectiveProjection, Projection},
     math::ops,
     prelude::*,
     render::{
@@ -147,7 +147,19 @@ struct InFlightFrame {
     /// runtime said `should_render == false`, in which case there is nothing to
     /// release and no layer to submit.
     acquired: bool,
+    /// What `xrLocateViews` reported for this frame's predicted display time.
+    ///
+    /// The composition layer **must** declare the same poses and FOVs the
+    /// image was rendered with. Submitting anything else tells the compositor
+    /// to reproject from a viewpoint that was never drawn, which shows up as
+    /// the world sliding around as the head moves. Empty until
+    /// [`xr_locate_views`] fills it, and a frame with no views submits no layer.
+    views: Vec<openxr::View>,
 }
+
+/// Marks the camera driven by the runtime's per-eye poses and projections.
+#[derive(Component)]
+pub struct XrCamera;
 
 /// Creates the OpenXR instance and teaches Bevy's Vulkan init which extensions
 /// the runtime requires.
@@ -246,6 +258,17 @@ impl Plugin for OpenXrPlugin {
                 .run_if(resource_exists::<OpenXrSession>),
         );
 
+        // After `xr_begin_frame`, which supplies the predicted display time
+        // this query has to be made against, and before transform propagation
+        // and extract consume the result.
+        app.add_systems(
+            PreUpdate,
+            xr_locate_views
+                .run_if(resource_exists::<OpenXrSession>)
+                .run_if(resource_exists::<XrReferenceSpace>)
+                .run_if(resource_exists::<OpenXrSwapchain>),
+        );
+
         // `Last` runs before extract, so the image acquired here is the one
         // `extract_cameras` resolves `XR_VIEW_HANDLE` to this frame. Acquiring
         // this late also holds the runtime's image for the shortest window, and
@@ -339,6 +362,13 @@ pub struct OpenXrSwapchain {
     pub resolution: UVec2,
     pub view_count: u32,
     pub format: TextureFormat,
+}
+
+impl OpenXrSwapchain {
+    /// Width over height of one eye's image.
+    pub fn aspect_ratio(&self) -> f32 {
+        self.resolution.x as f32 / self.resolution.y as f32
+    }
 }
 
 /// What [`init_openxr`] produces: the OpenXR handles, plus the Vulkan
@@ -833,12 +863,30 @@ pub fn enclosing_fov(views: &[openxr::View]) -> Option<openxr::Fovf> {
     })
 }
 
-/// A symmetric field of view matching Bevy's default perspective projection.
+/// The vertical FOV a symmetric projection needs to contain `enclosing`.
+///
+/// Setting `aspect_ratio` on the camera's [`Projection`] directly is futile:
+/// `camera_system` calls `CameraProjection::update` every frame and overwrites
+/// it from the render target's dimensions. Only the vertical angle survives, so
+/// the horizontal requirement has to be folded into it — widening vertically
+/// until the frustum is at least as wide horizontally as the eyes need.
+pub fn culling_fov_y(enclosing: openxr::Fovf, aspect_ratio: f32) -> f32 {
+    let half_vertical = enclosing.angle_up.abs().max(enclosing.angle_down.abs());
+    let half_horizontal = enclosing.angle_left.abs().max(enclosing.angle_right.abs());
+
+    // What vertical half-angle yields `half_horizontal` at this aspect ratio.
+    let needed_for_width = ops::atan(ops::tan(half_horizontal) / aspect_ratio);
+
+    2.0 * half_vertical.max(needed_for_width)
+}
+
+/// A symmetric field of view, used only to seed the camera before the first
+/// `xrLocateViews` reports. Every frame after that overwrites it.
 ///
 /// A placeholder for what `xrLocateViews` reports. Real runtimes supply
 /// *asymmetric* per-eye FOVs, and this and the camera's `MultiviewSubview`
 /// projections are two halves of the same lie — step 3 replaces both together.
-fn placeholder_fov(resolution: UVec2) -> openxr::Fovf {
+pub fn placeholder_fov(resolution: UVec2) -> openxr::Fovf {
     // `PerspectiveProjection::default().fov` is the vertical angle.
     let half_vertical = core::f32::consts::PI / 8.0;
     let aspect = resolution.x as f32 / resolution.y as f32;
@@ -886,19 +934,24 @@ fn xr_submit_frame(
     // eyes were rendered in one pass into one texture, and the compositor is
     // handed two slices of it.
     //
-    // The poses are identity because `xrLocateViews` isn't wired up yet, so the
-    // runtime will reproject as though the head never moved. The image is
-    // present and wrong, which is exactly what this step is proving.
+    // The pose and FOV declared here are the ones `xrLocateViews` reported and
+    // the ones the image was rendered with. They have to agree — the
+    // compositor reprojects from what it is told, so a mismatch shows up as the
+    // world sliding around as the head turns.
     let views: Vec<_> = match (swapchain.as_deref(), space.as_deref()) {
-        (Some(swapchain), Some(_)) => (0..swapchain.view_count)
-            .map(|layer| {
+        (Some(swapchain), Some(_)) => in_flight
+            .views
+            .iter()
+            .take(swapchain.view_count as usize)
+            .enumerate()
+            .map(|(layer, view)| {
                 openxr::CompositionLayerProjectionView::new()
-                    .pose(openxr::Posef::IDENTITY)
-                    .fov(placeholder_fov(swapchain.resolution))
+                    .pose(view.pose)
+                    .fov(view.fov)
                     .sub_image(
                         openxr::SwapchainSubImage::new()
                             .swapchain(&swapchain.swapchain)
-                            .image_array_index(layer)
+                            .image_array_index(layer as u32)
                             .image_rect(openxr::Rect2Di {
                                 offset: openxr::Offset2Di { x: 0, y: 0 },
                                 extent: openxr::Extent2Di {
@@ -1032,7 +1085,79 @@ fn xr_begin_frame(mut session: ResMut<OpenXrSession>, mut frame_loop: ResMut<XrF
     frame_loop.in_flight = Some(InFlightFrame {
         frame_state,
         acquired: false,
+        views: Vec::new(),
     });
+}
+
+/// Drives the camera's per-eye poses and projections from the runtime.
+///
+/// Runs after [`xr_begin_frame`], because `xrLocateViews` is asked where the
+/// eyes will be at *this frame's* predicted display time — the value
+/// `xrWaitFrame` just returned. Querying against any other timestamp produces a
+/// correctly-computed image of the wrong moment.
+fn xr_locate_views(
+    session: Res<OpenXrSession>,
+    space: Res<XrReferenceSpace>,
+    swapchain: Res<OpenXrSwapchain>,
+    mut frame_loop: ResMut<XrFrameLoop>,
+    mut cameras: Query<(&mut Multiview, &mut Projection), With<XrCamera>>,
+) {
+    let Some(in_flight) = frame_loop.in_flight.as_mut() else {
+        return;
+    };
+
+    let (flags, views) = match session.session.locate_views(
+        openxr::ViewConfigurationType::PRIMARY_STEREO,
+        in_flight.frame_state.predicted_display_time,
+        &space.0,
+    ) {
+        Ok(located) => located,
+        Err(err) => {
+            error!("xrLocateViews failed: {err}");
+            return;
+        }
+    };
+
+    // The runtime is allowed to report views it cannot vouch for — during
+    // tracking loss, for instance. Holding the previous frame's pose is far
+    // better than snapping the head to the origin.
+    if !flags.contains(openxr::ViewStateFlags::ORIENTATION_VALID)
+        || !flags.contains(openxr::ViewStateFlags::POSITION_VALID)
+    {
+        return;
+    }
+
+    for (mut multiview, mut projection) in &mut cameras {
+        if multiview.views.len() != views.len() {
+            warn!(
+                "camera has {} subview(s) but the runtime located {}; skipping",
+                multiview.views.len(),
+                views.len()
+            );
+            continue;
+        }
+
+        for (subview, view) in multiview.views.iter_mut().zip(&views) {
+            // The camera's own transform is the play-space origin, so a
+            // subview's offset from it is the eye's full pose in the reference
+            // space. Locomotion later means moving the camera; the eyes stay
+            // relative to it.
+            subview.view_from_camera = transform_from_pose(view.pose);
+            subview.clip_from_view = clip_from_fov(view.fov, XR_NEAR);
+        }
+
+        // Bevy frustum-culls against this, not against the per-eye
+        // projections — see `enclosing_fov`.
+        if let Some(enclosing) = enclosing_fov(&views) {
+            *projection = Projection::Perspective(PerspectiveProjection {
+                fov: culling_fov_y(enclosing, swapchain.aspect_ratio()),
+                near: XR_NEAR,
+                ..default()
+            });
+        }
+    }
+
+    in_flight.views = views;
 }
 
 /// Acquires this frame's swapchain image and points [`XR_VIEW_HANDLE`] at it.
@@ -1245,5 +1370,32 @@ mod tests {
     #[test]
     fn enclosing_fov_of_nothing_is_none() {
         assert!(enclosing_fov(&[]).is_none());
+    }
+
+    /// The culling FOV must widen vertically to cover the horizontal
+    /// requirement, because `camera_system` overwrites any aspect ratio we set.
+    #[test]
+    fn culling_fov_widens_for_a_narrow_target() {
+        let fov = openxr::Fovf {
+            angle_left: -1.0,
+            angle_right: 1.0,
+            angle_up: 0.5,
+            angle_down: -0.5,
+        };
+
+        // A portrait target (the Quest/Monado shape) forces vertical widening:
+        // 1.0 rad of horizontal half-angle needs more than 0.5 vertical.
+        let portrait = culling_fov_y(fov, 896.0 / 1007.0);
+        let needed = 2.0 * ops::atan(ops::tan(1.0f32) / (896.0 / 1007.0));
+        assert!(
+            (portrait - needed).abs() < 1e-5,
+            "got {portrait}, needed {needed}"
+        );
+        assert!(portrait > 2.0 * 0.5);
+
+        // A very wide target already covers the horizontal span, so the
+        // vertical half-angle governs and is left alone.
+        let wide = culling_fov_y(fov, 100.0);
+        assert!((wide - 1.0).abs() < 1e-5, "got {wide}");
     }
 }
