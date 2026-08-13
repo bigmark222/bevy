@@ -1,10 +1,13 @@
 //! Proof-of-concept OpenXR/Vulkan interop for Bevy.
 //!
-//! This is step 1 of driving Bevy's multiview rendering from an OpenXR runtime:
-//! stand up an `XrInstance`, let the runtime dictate which Vulkan instance and
-//! device extensions Bevy must enable, and create an `XrSession` against the
-//! `VkDevice` Bevy ends up building. It renders nothing yet — success is a live
-//! session handle.
+//! Drives Bevy's multiview rendering from an OpenXR runtime: stand up an
+//! `XrInstance`, let the runtime dictate which Vulkan instance and device
+//! extensions Bevy must enable, create an `XrSession` against the `VkDevice`
+//! Bevy ends up building, wrap the runtime's stereo swapchain as Bevy texture
+//! views, and drive it all from the OpenXR frame loop.
+//!
+//! Per-eye poses and asymmetric projections from `xrLocateViews` are not here
+//! yet, so the eyes are a fixed IPD offset and the head does not move.
 //!
 //! # Why this doesn't fork Bevy's renderer initialization
 //!
@@ -51,6 +54,7 @@
 
 use ash::vk::Handle as _;
 use bevy::{
+    camera::ManualTextureViewHandle,
     prelude::*,
     render::{
         render_resource::{
@@ -58,7 +62,7 @@ use bevy::{
             TextureViewDescriptor, TextureViewDimension,
         },
         renderer::{raw_vulkan_init::RawVulkanInitSettings, RenderDevice},
-        texture::ManualTextureView,
+        texture::{ManualTextureView, ManualTextureViews},
         RenderApp,
     },
 };
@@ -92,6 +96,49 @@ pub struct OpenXrSession {
 /// through the log once logging actually exists.
 #[derive(Resource)]
 struct OpenXrInitError(String);
+
+/// The render target the XR camera draws through.
+///
+/// Constant for the life of the app. The [`ManualTextureView`] *behind* it is
+/// swapped every frame, because `xrAcquireSwapchainImage` hands out a different
+/// image each time. That works because [`ManualTextureViews`] is an
+/// `ExtractResource`: the main world's copy is cloned into the render world
+/// during extract, and `extract_cameras` is explicitly ordered *after* that
+/// clone (`bevy_render::camera`), so a write here lands in the same frame's
+/// render.
+pub const XR_VIEW_HANDLE: ManualTextureViewHandle = ManualTextureViewHandle(0x5852);
+
+/// Per-frame state for the OpenXR frame loop.
+#[derive(Resource)]
+pub struct XrFrameLoop {
+    /// Last state reported by `XrEventDataSessionStateChanged`.
+    pub state: openxr::SessionState,
+    /// True between `xrBeginSession` and `xrEndSession`. Frames may only be
+    /// waited on and submitted while this holds.
+    pub running: bool,
+    /// Set between `xrBeginFrame` and `xrEndFrame`. The presence of this is
+    /// what obliges us to call `xrEndFrame`, whether or not we rendered.
+    in_flight: Option<InFlightFrame>,
+}
+
+impl Default for XrFrameLoop {
+    fn default() -> Self {
+        Self {
+            state: openxr::SessionState::UNKNOWN,
+            running: false,
+            in_flight: None,
+        }
+    }
+}
+
+/// A frame that has been begun but not yet submitted.
+struct InFlightFrame {
+    frame_state: openxr::FrameState,
+    /// Whether a swapchain image was acquired for this frame. False when the
+    /// runtime said `should_render == false`, in which case there is nothing to
+    /// release and no layer to submit.
+    acquired: bool,
+}
 
 /// Creates the OpenXR instance and teaches Bevy's Vulkan init which extensions
 /// the runtime requires.
@@ -174,7 +221,32 @@ impl Plugin for OpenXrInitPlugin {
 pub struct OpenXrPlugin;
 
 impl Plugin for OpenXrPlugin {
-    fn build(&self, _app: &mut App) {}
+    fn build(&self, app: &mut App) {
+        app.init_resource::<XrFrameLoop>();
+
+        // The frame loop straddles the render boundary: the runtime's image has
+        // to be in `ManualTextureViews` before extract, and the frame can only
+        // be submitted once rendering has finished. Bevy has no main-world
+        // schedule after the render sub-app runs, so a frame is submitted at
+        // the top of the *next* one — `xrEndFrame(N)` still precedes
+        // `xrWaitFrame(N+1)`, which is all the spec requires.
+        app.add_systems(
+            First,
+            (xr_submit_frame, xr_poll_events, xr_begin_frame)
+                .chain()
+                .run_if(resource_exists::<OpenXrSession>),
+        );
+
+        // `Last` runs before extract, so the image acquired here is the one
+        // `extract_cameras` resolves `XR_VIEW_HANDLE` to this frame. Acquiring
+        // this late also holds the runtime's image for the shortest window, and
+        // leaves room for a future `xrLocateViews` to run against the predicted
+        // display time in between.
+        app.add_systems(
+            Last,
+            xr_acquire_image.run_if(resource_exists::<OpenXrSwapchain>),
+        );
+    }
 
     // `finish` runs after `RenderPlugin` has initialized the renderer, which is
     // the earliest point a `RenderDevice` — and therefore a `VkDevice` — exists.
@@ -211,6 +283,17 @@ impl Plugin for OpenXrPlugin {
                     swapchain.view_count,
                     swapchain.format,
                 );
+
+                // Seed the registry so a camera targeting `XR_VIEW_HANDLE` has
+                // something valid to resolve before the first acquire. Which
+                // image it is doesn't matter; it is replaced every frame from
+                // `xr_acquire_image`.
+                if let Some(first) = swapchain.views.first().cloned() {
+                    app.world_mut()
+                        .resource_mut::<ManualTextureViews>()
+                        .insert(XR_VIEW_HANDLE, first);
+                }
+
                 app.insert_resource(swapchain);
             }
             Err(err) => error!("failed to wrap the OpenXR swapchain: {err}"),
@@ -624,4 +707,186 @@ fn create_session(app: &App) -> Result<OpenXrSession, Box<dyn Error>> {
         frame_waiter,
         frame_stream,
     })
+}
+
+/// Submits the frame begun on the previous tick.
+///
+/// This runs at the *top* of the frame rather than after rendering because
+/// there is no main-world schedule following the render sub-app. See the
+/// ordering note in [`OpenXrPlugin::build`].
+///
+/// `xrEndFrame` is unconditional once `xrBeginFrame` has been called — even
+/// with nothing rendered and no layers to show. Skipping it is the usual way
+/// this loop wedges.
+fn xr_submit_frame(
+    mut session: ResMut<OpenXrSession>,
+    swapchain: Option<ResMut<OpenXrSwapchain>>,
+    mut frame_loop: ResMut<XrFrameLoop>,
+) {
+    let Some(in_flight) = frame_loop.in_flight.take() else {
+        return;
+    };
+
+    if let (true, Some(mut swapchain)) = (in_flight.acquired, swapchain)
+        && let Err(err) = swapchain.swapchain.release_image()
+    {
+        error!("xrReleaseSwapchainImage failed: {err}");
+    }
+
+    // Step 4 submits no layers: this proves the loop runs and the session stays
+    // healthy. The projection layer that actually shows the rendered image
+    // arrives in the next commit.
+    if let Err(err) = session.frame_stream.end(
+        in_flight.frame_state.predicted_display_time,
+        openxr::EnvironmentBlendMode::OPAQUE,
+        &[],
+    ) {
+        error!("xrEndFrame failed: {err}");
+    }
+}
+
+/// Drains the OpenXR event queue and drives the session state machine.
+///
+/// The runtime decides when the session may run: it advertises `READY`, and
+/// only then may `xrBeginSession` be called and frames submitted. Nothing
+/// happens at all until this transition arrives.
+fn xr_poll_events(
+    context: Res<OpenXrContext>,
+    session: Res<OpenXrSession>,
+    mut frame_loop: ResMut<XrFrameLoop>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let mut buffer = openxr::EventDataBuffer::new();
+
+    loop {
+        let event = match context.instance.poll_event(&mut buffer) {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(err) => {
+                error!("xrPollEvent failed: {err}");
+                break;
+            }
+        };
+
+        match event {
+            openxr::Event::SessionStateChanged(changed) => {
+                let state = changed.state();
+                info!(
+                    "OpenXR session state: {:?} -> {:?}",
+                    frame_loop.state, state
+                );
+                frame_loop.state = state;
+
+                match state {
+                    openxr::SessionState::READY => {
+                        match session
+                            .session
+                            .begin(openxr::ViewConfigurationType::PRIMARY_STEREO)
+                        {
+                            Ok(_) => {
+                                frame_loop.running = true;
+                                info!("xrBeginSession OK; the frame loop is live");
+                            }
+                            Err(err) => error!("xrBeginSession failed: {err}"),
+                        }
+                    }
+                    openxr::SessionState::STOPPING => {
+                        frame_loop.running = false;
+                        if let Err(err) = session.session.end() {
+                            error!("xrEndSession failed: {err}");
+                        }
+                    }
+                    openxr::SessionState::EXITING | openxr::SessionState::LOSS_PENDING => {
+                        frame_loop.running = false;
+                        exit.write(AppExit::Success);
+                    }
+                    _ => {}
+                }
+            }
+            openxr::Event::InstanceLossPending(_) => {
+                warn!("OpenXR instance loss pending; shutting down");
+                exit.write(AppExit::Success);
+            }
+            openxr::Event::EventsLost(lost) => {
+                warn!("OpenXR dropped {} event(s)", lost.lost_event_count());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Waits for the runtime's frame pacing, then opens a frame.
+///
+/// `xrWaitFrame` blocks: this is the runtime throttling the app to the
+/// compositor's cadence, and it is why the whole main schedule runs after it.
+fn xr_begin_frame(mut session: ResMut<OpenXrSession>, mut frame_loop: ResMut<XrFrameLoop>) {
+    if !frame_loop.running {
+        return;
+    }
+
+    let frame_state = match session.frame_waiter.wait() {
+        Ok(frame_state) => frame_state,
+        Err(err) => {
+            error!("xrWaitFrame failed: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = session.frame_stream.begin() {
+        error!("xrBeginFrame failed: {err}");
+        return;
+    }
+
+    frame_loop.in_flight = Some(InFlightFrame {
+        frame_state,
+        acquired: false,
+    });
+}
+
+/// Acquires this frame's swapchain image and points [`XR_VIEW_HANDLE`] at it.
+///
+/// Runs in `Last`, so the write lands before extract and the camera renders
+/// into the image the runtime just handed us.
+fn xr_acquire_image(
+    mut swapchain: ResMut<OpenXrSwapchain>,
+    mut frame_loop: ResMut<XrFrameLoop>,
+    mut manual_views: ResMut<ManualTextureViews>,
+) {
+    let Some(in_flight) = frame_loop.in_flight.as_mut() else {
+        return;
+    };
+
+    // The runtime can tell us not to bother — the session isn't visible, or the
+    // compositor is throttling. We still owe it an `xrEndFrame`, but there is
+    // no image and no layer.
+    if !in_flight.frame_state.should_render {
+        return;
+    }
+
+    let index = match swapchain.swapchain.acquire_image() {
+        Ok(index) => index,
+        Err(err) => {
+            error!("xrAcquireSwapchainImage failed: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = swapchain.swapchain.wait_image(openxr::Duration::INFINITE) {
+        error!("xrWaitSwapchainImage failed: {err}");
+        return;
+    }
+
+    in_flight.acquired = true;
+
+    match swapchain.views.get(index as usize) {
+        Some(view) => {
+            manual_views.insert(XR_VIEW_HANDLE, view.clone());
+        }
+        None => {
+            error!(
+                "runtime returned swapchain image index {index}, but only {} image(s) were wrapped",
+                swapchain.views.len()
+            );
+        }
+    }
 }
