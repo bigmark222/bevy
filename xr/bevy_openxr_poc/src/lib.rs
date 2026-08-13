@@ -269,6 +269,10 @@ impl Plugin for OpenXrPlugin {
                 .run_if(resource_exists::<OpenXrSwapchain>),
         );
 
+        // Diagnostic: proves the stereo separation is physically correct, not
+        // merely present. Runs once, well after tracking settles.
+        app.add_systems(Update, xr_report_disparity);
+
         // `Last` runs before extract, so the image acquired here is the one
         // `extract_cameras` resolves `XR_VIEW_HANDLE` to this frame. Acquiring
         // this late also holds the runtime's image for the shortest window, and
@@ -1208,6 +1212,152 @@ fn xr_acquire_image(
     }
 }
 
+/// One eye's placement and projection, as actually used to render.
+#[derive(Clone, Copy, Debug)]
+pub struct EyeGeometry {
+    pub world_from_view: Mat4,
+    pub clip_from_view: Mat4,
+}
+
+/// Horizontal separation of a point between the two eyes, in NDC.
+#[derive(Clone, Copy, Debug)]
+pub struct DisparitySample {
+    pub depth: f32,
+    /// Left eye's NDC x minus the right eye's. Positive for correct stereo:
+    /// an object ahead of you sits further right in your left eye's image.
+    pub disparity: f32,
+    /// `disparity * depth`. Constant across depths iff disparity obeys the
+    /// 1/depth law it physically must — this is the number that matters.
+    pub invariant: f32,
+}
+
+/// Measures stereo disparity at a series of depths straight ahead.
+///
+/// Eyeballing two side-by-side images tells you *that* they differ, not that
+/// they differ **correctly**. A wrong pose scale, a swapped IPD sign, or eyes
+/// that never actually moved apart all still produce two visibly different
+/// pictures. Disparity has to fall off as 1/depth, so `disparity * depth` is
+/// constant — measuring that turns "looks about right" into a number.
+///
+/// The head is taken as the midpoint of the two eyes, looking along the left
+/// eye's forward axis; the two eyes' orientations agree on every runtime that
+/// isn't canting its displays, and a small disagreement doesn't change the
+/// depth relationship being tested.
+pub fn measure_disparity(
+    left: &EyeGeometry,
+    right: &EyeGeometry,
+    depths: &[f32],
+) -> Vec<DisparitySample> {
+    let left_eye = left.world_from_view.w_axis.truncate();
+    let right_eye = right.world_from_view.w_axis.truncate();
+    let head = (left_eye + right_eye) / 2.0;
+    // Column 2 of a view matrix is +Z; view space looks down -Z.
+    let forward = -left.world_from_view.z_axis.truncate().normalize();
+
+    let ndc_x = |eye: &EyeGeometry, point: Vec3| {
+        let clip = eye.clip_from_view * eye.world_from_view.inverse() * point.extend(1.0);
+        clip.x / clip.w
+    };
+
+    depths
+        .iter()
+        .map(|&depth| {
+            let point = head + forward * depth;
+            let disparity = ndc_x(left, point) - ndc_x(right, point);
+            DisparitySample {
+                depth,
+                disparity,
+                invariant: disparity * depth,
+            }
+        })
+        .collect()
+}
+
+/// Logs measured stereo disparity against the law it must obey.
+///
+/// Runs once, after tracking has settled. This is the check that separates
+/// "two different images" from "correct stereo" — see [`measure_disparity`].
+fn xr_report_disparity(
+    cameras: Query<(&GlobalTransform, &Multiview), With<XrCamera>>,
+    mut frames: Local<u32>,
+) {
+    // Late enough that poses are live and pipelines have compiled.
+    const REPORT_AT: u32 = 120;
+
+    *frames += 1;
+    if *frames != REPORT_AT {
+        return;
+    }
+
+    for (camera_from_world, multiview) in &cameras {
+        let [left, right] = match multiview.views.as_slice() {
+            [left, right] => [left, right],
+            other => {
+                warn!(
+                    "expected 2 subviews for a disparity check, found {}",
+                    other.len()
+                );
+                continue;
+            }
+        };
+
+        let geometry = |subview: &bevy::camera::MultiviewSubview| EyeGeometry {
+            world_from_view: camera_from_world
+                .mul_transform(subview.view_from_camera)
+                .to_matrix(),
+            clip_from_view: subview.clip_from_view,
+        };
+
+        let left = geometry(left);
+        let right = geometry(right);
+
+        let ipd = (left.world_from_view.w_axis.truncate()
+            - right.world_from_view.w_axis.truncate())
+        .length();
+
+        let samples = measure_disparity(&left, &right, &[0.5, 1.0, 2.0, 4.0]);
+
+        info!("stereo disparity check (IPD {:.1} mm):", ipd * 1000.0);
+        for sample in &samples {
+            info!(
+                "  depth {:>4.1} m -> disparity {:+.5} ndc, disparity*depth {:.5}",
+                sample.depth, sample.disparity, sample.invariant
+            );
+        }
+
+        let invariants: Vec<f32> = samples.iter().map(|sample| sample.invariant).collect();
+        let mean = invariants.iter().sum::<f32>() / invariants.len() as f32;
+        let spread = invariants
+            .iter()
+            .map(|value| (value - mean).abs())
+            .fold(0.0f32, f32::max);
+        let relative = if mean.abs() > f32::EPSILON {
+            spread / mean.abs()
+        } else {
+            f32::INFINITY
+        };
+
+        if samples.iter().any(|sample| sample.disparity <= 0.0) {
+            error!(
+                "disparity is not positive at every depth — the eyes are swapped \
+                 (an object ahead must appear further RIGHT in the LEFT eye)"
+            );
+        } else if relative > 0.02 {
+            error!(
+                "disparity*depth varies by {:.1}% — it should be constant. \
+                 Stereo separation is not scaling as 1/depth, which points at the \
+                 eye poses rather than the projections.",
+                relative * 100.0
+            );
+        } else {
+            info!(
+                "disparity*depth constant to {:.2}% — stereo geometry is correct",
+                relative * 100.0
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1397,5 +1547,59 @@ mod tests {
         // vertical half-angle governs and is left alone.
         let wide = culling_fov_y(fov, 100.0);
         assert!((wide - 1.0).abs() < 1e-5, "got {wide}");
+    }
+
+    /// Disparity must fall off as 1/depth. This pins the law that
+    /// `xr_report_disparity` checks against live runtime data, using synthetic
+    /// eyes whose separation is known exactly.
+    #[test]
+    fn disparity_scales_as_inverse_depth() {
+        const HALF_IPD: f32 = 0.032;
+        let clip_from_view = clip_from_fov(symmetric(core::f32::consts::PI / 2.0, 1.0), XR_NEAR);
+
+        let eye = |x: f32| EyeGeometry {
+            world_from_view: Mat4::from_translation(Vec3::new(x, 0.0, 0.0)),
+            clip_from_view,
+        };
+
+        let samples = measure_disparity(&eye(-HALF_IPD), &eye(HALF_IPD), &[0.5, 1.0, 2.0, 4.0]);
+
+        // Correct stereo: an object ahead sits further right in the left eye.
+        for sample in &samples {
+            assert!(
+                sample.disparity > 0.0,
+                "depth {} gave disparity {}",
+                sample.depth,
+                sample.disparity
+            );
+        }
+
+        // The invariant is the whole point: constant across every depth.
+        let first = samples[0].invariant;
+        for sample in &samples {
+            assert!(
+                (sample.invariant - first).abs() / first < 1e-4,
+                "disparity*depth drifted: {:?}",
+                samples
+            );
+        }
+
+        // And halving the distance must double the separation.
+        assert!((samples[0].disparity / samples[1].disparity - 2.0).abs() < 1e-4);
+    }
+
+    /// Eyes at the same place produce no disparity — the degenerate case the
+    /// live check has to be able to catch.
+    #[test]
+    fn coincident_eyes_have_no_disparity() {
+        let clip_from_view = clip_from_fov(symmetric(core::f32::consts::PI / 2.0, 1.0), XR_NEAR);
+        let eye = EyeGeometry {
+            world_from_view: Mat4::IDENTITY,
+            clip_from_view,
+        };
+
+        for sample in measure_disparity(&eye, &eye, &[0.5, 2.0]) {
+            assert!(sample.disparity.abs() < 1e-6);
+        }
     }
 }
